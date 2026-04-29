@@ -10,19 +10,31 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bitcoin::p2p::{
-    address::{AddrV2, AddrV2Message},
-    ServiceFlags,
+use bitcoin::{
+    consensus::deserialize, ecdsa::Signature, hashes::Hash, secp256k1::PublicKey, BlockHash,
+    Network, ScriptBuf, Transaction, Witness, XOnlyPublicKey,
 };
-use bitcoin::{hashes::Hash, BlockHash, Network};
+use bitcoin::{
+    p2p::{
+        address::{AddrV2, AddrV2Message},
+        ServiceFlags,
+    },
+    Script,
+};
 use bitcoinkernel::{
-    core::BlockHashExt, prelude::BlockValidationStateExt, ChainType, ChainstateManagerBuilder,
-    Context, ContextBuilder, Log, Logger, SynchronizationState, ValidationMode,
+    core::{
+        BlockHashExt, BlockSpentOutputsExt, CoinExt, ScriptPubkeyExt, TransactionExt,
+        TransactionSpentOutputsExt, TxOutExt,
+    },
+    prelude::BlockValidationStateExt,
+    ChainType, ChainstateManagerBuilder, Context, ContextBuilder, Log, Logger, ProcessBlockResult,
+    SynchronizationState, ValidationMode,
 };
 use kernel_node::{
     daemonize::Daemonize,
     kernel_util::NetworkExt,
     peer::{BitcoinPeer, NodeState, TipState},
+    wallet::SpWallet,
 };
 use kernel_node::{
     ipc::IpcInterface,
@@ -31,6 +43,9 @@ use kernel_node::{
 };
 use log::{debug, error, info, warn};
 use p2p::dns::{BITCOIN_SEEDS, SIGNET_SEEDS, TESTNET3_SEEDS, TESTNET4_SEEDS};
+use silentpayments::utils::receiving::{
+    calculate_ecdh_shared_secret, calculate_tweak_data, get_pubkey_from_input,
+};
 use tokio::net::UnixListener;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
@@ -172,6 +187,7 @@ fn run(
     shutdown_rx: mpsc::Receiver<()>,
     addr_rx: mpsc::Receiver<Vec<AddrV2Message>>,
     block_rx: mpsc::Receiver<bitcoinkernel::Block>,
+    wallet: SpWallet,
 ) -> std::io::Result<()> {
     let mut table = addrman::Table::<TABLE_WIDTH, TABLE_SLOT, MAX_BUCKETS>::new();
     match connect {
@@ -305,7 +321,84 @@ fn run(
                 Ok(block) => {
                     debug!("Validating block.");
                     last_block = Instant::now();
-                    let _ = chainman.process_block(&block);
+                    let res = chainman.process_block(&block);
+                    if res == ProcessBlockResult::NewBlock {
+                        let tip = chainman.best_entry().unwrap();
+                        let block_spent_outputs = chainman.read_spent_outputs(&tip).unwrap();
+
+                        for (tx_index, tx) in block.transactions().enumerate() {
+                            // skip coinbase
+                            if tx_index == 0 {
+                                continue;
+                            }
+
+                            let mut input_pubkeys = Vec::new();
+                            let mut input_outpoints = Vec::new();
+
+                            let tx: Transaction =
+                                deserialize(&tx.consensus_encode().unwrap()).unwrap();
+                            let tx_spent_outputs = block_spent_outputs
+                                .transaction_spent_outputs(tx_index)
+                                .unwrap();
+
+                            for (txin_index, txin) in tx.input.into_iter().enumerate() {
+                                let script_sig = txin.script_sig.to_bytes();
+                                let witness = txin.witness.to_vec();
+                                // read the prevout script_pubkey from the block's undo data
+                                let script_pubkey = tx_spent_outputs
+                                    .coin(txin_index)
+                                    .unwrap()
+                                    .output()
+                                    .script_pubkey()
+                                    .to_bytes();
+
+                                if let Some(pubkey) =
+                                    get_pubkey_from_input(&script_sig, &witness, &script_pubkey)
+                                        .unwrap()
+                                {
+                                    let outpoint = txin.previous_output;
+                                    input_outpoints
+                                        .push((outpoint.txid.to_string(), outpoint.vout));
+                                    input_pubkeys.push(pubkey);
+                                }
+                            }
+
+                            if input_pubkeys.is_empty() {
+                                continue;
+                            }
+
+                            // Using all the eligible public keys from the input side, calculate the
+                            // shared secret for this recipient
+                            let input_pubkey_references: Vec<&PublicKey> =
+                                input_pubkeys.iter().collect();
+                            let tweak =
+                                calculate_tweak_data(&input_pubkey_references, &input_outpoints)
+                                    .unwrap();
+                            let ecdh_shared_secret =
+                                calculate_ecdh_shared_secret(&tweak, &wallet.b_scan);
+
+                            // after calculating the shared secret, scan the transaction output side for found inputs
+                            let mut pubkeys_to_check = Vec::new();
+                            for txout in tx.output {
+                                let spk = txout.script_pubkey;
+                                if spk.is_p2tr() {
+                                    // if this script is p2tr, the first 2 bytes are OP_1
+                                    // OP_PUSHBYTES_32
+                                    // and the remaining 32 bytes are the x-only public key
+                                    pubkeys_to_check.push(
+                                        XOnlyPublicKey::from_slice(&spk.to_bytes()[2..]).unwrap(),
+                                    );
+                                }
+                            }
+
+                            let found_outputs = wallet
+                                .receiver
+                                .scan_transaction(&ecdh_shared_secret, &pubkeys_to_check)
+                                .unwrap();
+
+                            println!("{:?}", found_outputs);
+                        }
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => {
                     if last_block.elapsed() > STALE_BLOCK_DURATION {
@@ -447,5 +540,16 @@ fn main() {
         })
     });
 
-    run(network, connect, node_state, shutdown_rx, addr_rx, block_rx).unwrap()
+    let wallet = SpWallet::new();
+
+    run(
+        network,
+        connect,
+        node_state,
+        shutdown_rx,
+        addr_rx,
+        block_rx,
+        wallet,
+    )
+    .unwrap()
 }
