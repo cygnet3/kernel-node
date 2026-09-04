@@ -9,7 +9,8 @@ use bitcoin::secp256k1::{Message, Secp256k1, SecretKey};
 use bitcoin::sighash::{EcdsaSighashType, SighashCache};
 use bitcoin::{
     absolute::LockTime, key::TweakedPublicKey, transaction::Version, Address, Amount,
-    CompressedPublicKey, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+    CompressedPublicKey, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid,
+    Witness,
 };
 use corepc_node::{Conf, Node, P2P};
 use kernel_node::server_capnp::server;
@@ -301,7 +302,7 @@ pub fn wait_for_core_mempool(core: &Node, txid: &str, timeout: Duration) {
 
 // Core cannot send to a silent payment address, so build the BIP-352 payment
 // here, broadcast it through Core, and mine it.
-pub fn fund_silent_payment(core: &Node, sp_address: &str, amount: Amount) {
+pub fn fund_silent_payment(core: &Node, sp_address: &str, amount: Amount) -> Txid {
     let secp = Secp256k1::new();
 
     let sender_sk = SecretKey::from_slice(&[0x21; 32]).unwrap();
@@ -387,4 +388,5 @@ pub fn fund_silent_payment(core: &Node, sp_address: &str, amount: Amount) {
     core.client.send_raw_transaction(&tx).unwrap();
     let miner = core.client.new_address().unwrap();
     core.client.generate_to_address(1, &miner).unwrap();
+    tx.compute_txid()
 }
